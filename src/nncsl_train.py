@@ -5,6 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 #
 
+# Function in this file:
+# 1. main as nncsl
+# 2. validate
+# 3. load_checkpoint
+# 4. init_model
+# 5. init_scheduler
+# 6. init_opt
+
 import os
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
@@ -25,6 +33,9 @@ from collections import OrderedDict
 import numpy as np
 from tqdm import tqdm
 
+# AllGather is used for gathering tensors from all processes, and 
+# AllReduce is used for performing the sum reduction operation across all processes, 
+# which is commonly used in gradient aggregation in distributed training.
 from src.utils import (
     AllGather,
     AllReduce
@@ -36,6 +47,7 @@ import random
 import torch
 import torch.nn.functional as F
 import src.resnet as resnet
+
 from src.utils import (
     gpu_timer,
     init_distributed,
@@ -44,15 +56,18 @@ from src.utils import (
     AverageMeter,
     make_buffer_lst
 )
+
 from src.losses import (
     init_paws_loss,
     make_labels_matrix
 )
+
 from src.data_manager import (
     init_data,
     make_transforms,
     make_multicrop_transform
 )
+
 from src.sgd import SGD
 from src.lars import LARS
 
@@ -91,54 +106,59 @@ def main(args):
     # ----------------------------------------------------------------------- #
     #  PASSED IN PARAMS FROM CONFIG FILE
     # ----------------------------------------------------------------------- #
-    # -- META
-    model_name = args['meta']['model_name']
-    output_dim = args['meta']['output_dim']
-    load_model = args['meta']['load_checkpoint']
-    save_ckpt = args['meta']['save_checkpoint']
-    start_task_idx = args['meta']['start_task_idx']
-    r_file = args['meta']['read_checkpoint']
+    # -- META 
+                                                         #CIFAR10 0.8%
+    model_name = args['meta']['model_name']              # resnet18
+    output_dim = args['meta']['output_dim']              # 128
+    load_model = args['meta']['load_checkpoint']         # False
+    save_ckpt = args['meta']['save_checkpoint']          # True
+    start_task_idx = args['meta']['start_task_idx']      # 0
+    r_file = args['meta']['read_checkpoint']             # None
     copy_data = args['meta']['copy_data']
     use_fp16 = args['meta']['use_fp16']
     w_paws = args['meta']['w_paws'] # weight for the paws loss
-    w_me_max = args['meta']['w_me_max'] # weight for the me-max loss
+    w_me_max = args['meta']['w_me_max'] # weight for the me-max loss    #MEM LOSS
     w_online = args['meta']['w_online'] # weight for the linear evaluation head
     w_dist = args['meta']['w_dist'] # weight for the distillation
+
     alpha = args['meta']['alpha'] # If 0, snn distillation, if 1, feature distillation
+
     use_pred_head = args['meta']['use_pred_head']
     device = torch.device(args['meta']['device'])
     torch.cuda.set_device(device)
 
     # -- CRITERTION
     reg = args['criterion']['me_max']
-    supervised_views = args['criterion']['supervised_views']
+    supervised_views = args['criterion']['supervised_views']  # 2
     # classes_per_batch = args['criterion']['classes_per_batch']
-    s_batch_size = args['criterion']['supervised_imgs_per_class']
-    us_batch_size = args['criterion']['unlabeled_supervised_imgs_per_class']
-    u_batch_size = args['criterion']['unsupervised_batch_size']
-    temperature = args['criterion']['temperature']
-    sharpen = args['criterion']['sharpen']
+    s_batch_size = args['criterion']['supervised_imgs_per_class'] # 5
+    us_batch_size = args['criterion']['unlabeled_supervised_imgs_per_class'] # 3
+    u_batch_size = args['criterion']['unsupervised_batch_size'] #256
+    temperature = args['criterion']['temperature'] # 0.1
+    sharpen = args['criterion']['sharpen'] #0.25
 
     # -- DATA
-    unlabeled_frac = args['data']['unlabeled_frac']
-    color_jitter = args['data']['color_jitter_strength']
-    normalize = args['data']['normalize']
-    root_path = args['data']['root_path']
-    image_folder = args['data']['image_folder']
-    dataset_name = args['data']['dataset']
-    subset_path = args['data']['subset_path']
-    subset_path_cls = args['data']['subset_path_cls']
-    unique_classes = args['data']['unique_classes_per_rank']
-    multicrop = args['data']['multicrop']
-    us_multicrop = args['data']['us_multicrop']
-    label_smoothing = args['data']['label_smoothing']
-    data_seed = args['data']['data_seed']
+    unlabeled_frac = args['data']['unlabeled_frac'] #0.92
+    color_jitter = args['data']['color_jitter_strength'] #0.5
+    normalize = args['data']['normalize'] #True
+    root_path = args['data']['root_path'] #datasets/
+    image_folder = args['data']['image_folder'] #cifar10/
+    dataset_name = args['data']['dataset'] #cifar10
+    subset_path = args['data']['subset_path'] #subsets/cifar10/0.8%_seed0.txt
+    subset_path_cls = args['data']['subset_path_cls'] #subsets/cifar10/0.8%_seed0_cls.txt
+    unique_classes = args['data']['unique_classes_per_rank'] #false
+    multicrop = args['data']['multicrop'] #2
+    us_multicrop = args['data']['us_multicrop'] #2
+    label_smoothing = args['data']['label_smoothing'] #0.1
+    data_seed = args['data']['data_seed'] #0
     num_classes = {'cifar10': 10, 'cifar100': 100, 'imagenet': 100, 'tinyimagenet':10}[dataset_name]
+
     if 'cifar' in dataset_name or 'tiny' in dataset_name:
         data_seed = args['data']['data_seed']
         crop_scale = (0.75, 1.0) if multicrop > 0 else (0.5, 1.0)
         mc_scale = (0.3, 0.75)
         mc_size = 18
+
     else:
         crop_scale = (0.14, 1.0) if multicrop > 0 else (0.08, 1.0)
         mc_scale = (0.05, 0.14)
@@ -146,9 +166,9 @@ def main(args):
 
     # -- OPTIMIZATION
     wd = float(args['optimization']['weight_decay'])
-    num_epochs = args['optimization']['epochs']
-    warmup = args['optimization']['warmup']
-    start_lr = args['optimization']['start_lr']
+    num_epochs = args['optimization']['epochs'] #250
+    warmup = args['optimization']['warmup'] #10
+    start_lr = args['optimization']['start_lr'] #0.08
     lr = args['optimization']['lr']
     final_lr = args['optimization']['final_lr']
     lr_cls = args['optimization']['lr_cls']
@@ -165,7 +185,7 @@ def main(args):
     num_tasks = args['continual']['num_tasks']
     cl_setting = args['continual']['setting']
     mask = args['continual']['mask'] # Filtering
-    detach = args['continual']['detach'] # if false: use Linear evaluation head
+    detach = args['continual']['detach'] # if false: use Linear evaluation head (fOR nncsl: False)
     buffer_size = args['continual']['buffer_size'] # Buffer size 
     # ----------------------------------------------------------------------- #
 
@@ -212,7 +232,7 @@ def main(args):
         detach=detach)
     
 
-    # -- init losses
+    # -- init losses   paws: SNN Loss, MEM Loss, Probs
     paws, snn, sharpen = init_paws_loss(
         multicrop=multicrop,
         tau=temperature,
@@ -297,7 +317,7 @@ def main(args):
     # -- continual training loop
     pre_encoder = None
     filtered_proportion = 0.2
-    filtered_channels = int(output_dim * filtered_proportion)
+    filtered_channels = int(output_dim * filtered_proportion) #128 * 0.2 = 25
     buffer_lst = None
     num_in_buffer = 0
 
@@ -340,6 +360,7 @@ def main(args):
             visible_class_ul = sum(tasks, [])
         else:
             raise ValueError('unknown setting!')
+
         # -- assume support images are sampled with ClassStratifiedSampler
         num_cur_classes = len(tasks[task_idx])
         pre_classes = sum(tasks[:task_idx], [])
@@ -359,7 +380,7 @@ def main(args):
             s_batch_size=s_batch_size,
             world_size=world_size,
             device=device,
-            unique_classes=unique_classes,
+            unique_classes=unique_classes,     #false
             smoothing=label_smoothing,
             task_idx=task_idx)
         
@@ -511,7 +532,7 @@ def main(args):
 
                     # -- unsupervised imgs
                     uimgs = [u.to(device, non_blocking=True) for u in udata[:-1]]
-                    ulabels = udata[-1].to(device, non_blocking=True).repeat(2)
+                    ulabels = udata[-1].to(device, non_blocking=True).repeat(2)             # Repeat label for two views
 
                     # -- supervised imgs
                     global iter_supervised
@@ -523,7 +544,7 @@ def main(args):
                         sdata = next(iter_supervised)
                     finally:
                         slabels = sdata[-1].to(device, non_blocking=True).repeat(2)
-                        omatrix = make_one_hot_label(sdata[-1].to(device, non_blocking=True), num_seen_classes)
+                        omatrix = make_one_hot_label(sdata[-1].to(device, non_blocking=True), num_seen_classes)  # one-hot label for distillation
                         plabels = torch.cat([labels_matrix for _ in range(supervised_views)])   
                         olabels = torch.cat([omatrix for _ in range(supervised_views)])                        
                         simgs = [s.to(device, non_blocking=True) for s in sdata[:-1]]
@@ -534,7 +555,7 @@ def main(args):
                 (imgs, plabels, slabels, ulabels, olabels), dtime = gpu_timer(load_imgs)
                 data_meter.update(dtime)
 
-                def train_step():
+                 def train_step():
                     with torch.cuda.amp.autocast(enabled=use_fp16):
                         optimizer.zero_grad()
 
@@ -564,7 +585,7 @@ def main(args):
                             #         corresponding target views/supports
                             # --
                             if buffer_size == 0:
-                                num_support_mix = (supervised_views) * s_batch_size * num_cur_classes
+                                num_support_mix = (supervised_views) * s_batch_size * num_cur_classes       # Supervised_views : 2
                             else:
                                 num_support_mix = (supervised_views) * s_batch_size * num_seen_classes
                             num_u_data_mix =  u_batch_size 
@@ -585,7 +606,7 @@ def main(args):
                                 target_views[:num_u_data_mix]], dim=0)
 
                             # Step 3. compute paws loss with me-max regularization
-                            (ploss, me_max, probs_anchor) = paws(
+                            (ploss, me_max, probs_anchor) = paws(                                          # SNN Loss, MEM Loss, Probs
                                 anchor_views=anchor_views,
                                 anchor_supports=anchor_supports,
                                 anchor_support_labels=plabels_masked,
@@ -599,7 +620,7 @@ def main(args):
                             # # # Change the targets to onehot label for mix up
                             # online_eval_loss = cross_entropy_with_logits(slogits, olabels)
                             
-                            online_eval_loss = F.cross_entropy(slogits, slabels)
+                            online_eval_loss = F.cross_entropy(slogits, slabels)   #LIN Loss
 
 
                             # Step 5. Distillation

@@ -32,8 +32,18 @@ parser.add_argument(
 
 
 def process_main(rank, sel, fname, world_size, devices):
+    """ rank:
+            rank of the current process 
+        sel:
+            which script to run
+        fname:
+            name of config file to load
+        world_size:
+            number of processes (GPU) to use
+        devices:
+            which devices to use on local machine"""
+            
     import os
-
     import logging
     logging.basicConfig()
     logger = logging.getLogger()

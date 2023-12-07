@@ -76,7 +76,7 @@ def init_paws_loss(
             targets[targets < 1e-4] *= 0  # numerical stability
 
         # Step 3: compute cross-entropy loss H(targets, queries)
-        loss = torch.mean(torch.sum(torch.log(probs**(-targets)), dim=1))
+        loss = torch.mean(torch.sum(torch.log(probs**(-targets)), dim=1))   # cross-entropy : probs**(-targets) elementwise exponents
 
         # Step 4: compute me-max regularizer
         rloss = 0.
